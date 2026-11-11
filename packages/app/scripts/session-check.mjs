@@ -11,6 +11,22 @@
 import { chromium } from 'playwright'
 import { writeFileSync } from 'node:fs'
 
+// A test that dies without a verdict is worthless. Under a redirected/background
+// stdio this suite can be reaped mid-run; leave a verdict behind either way.
+const crashGuard = (error) => {
+  try {
+    writeFileSync(
+      new URL('./session-check.json', import.meta.url),
+      JSON.stringify({ crashed: String(error && error.stack || error) }, null, 2)
+    )
+  } catch {}
+  console.error('CRASH:', error)
+  process.exit(1)
+}
+process.on('uncaughtException', crashGuard)
+process.on('unhandledRejection', crashGuard)
+
+
 const url = process.argv[2] || 'http://127.0.0.1:8790/board/'
 const bridge = new URL(url).origin
 

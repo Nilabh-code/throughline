@@ -28,6 +28,11 @@ cd packages/app && node scripts/journey.mjs && node scripts/interact.mjs && node
 All three suites drive a real headless browser against the served app. A green run is the bar —
 "it rendered once" is not.
 
+Run them in the **foreground**. They take minutes and spawn Chromium; redirecting their output to a
+file or running them detached can have the process reaped mid-run with no message. Each suite writes
+its verdict next to itself (`scripts/session-check.json`) and now leaves a `{crashed: …}` verdict behind
+if it dies, so a silent exit is visible instead of invisible.
+
 ## Style
 
 - Two spaces, no semicolons, single quotes. Match the file you are in.

@@ -1,0 +1,11 @@
+{
+  "name": "@throughline/board-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The slice of the Hermes plugin SDK a plugin page actually uses, so plugin pages run outside Hermes.",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  }
+}

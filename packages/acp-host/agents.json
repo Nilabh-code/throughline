@@ -1,0 +1,53 @@
+{
+  "$comment": "One entry per ACP agent. Add a coworker by adding a command; nothing else in the system changes.",
+  "agents": [
+    {
+      "id": "hermes",
+      "label": "Hermes Agent",
+      "description": "Full agent toolset over ACP: files, shell, web, skills and memory.",
+      "command": "hermes",
+      "args": [
+        "acp"
+      ],
+      "cwd": ".",
+      "permission": "allow"
+    },
+    {
+      "id": "opencode",
+      "label": "OpenCode",
+      "description": "Terminal coding agent over its built-in ACP server.",
+      "command": "opencode",
+      "args": [
+        "acp"
+      ],
+      "cwd": ".",
+      "permission": "allow"
+    },
+    {
+      "id": "codex",
+      "label": "Codex",
+      "description": "OpenAI Codex CLI through its ACP adapter.",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@agentclientprotocol/codex-acp@2.6.0"
+      ],
+      "cwd": ".",
+      "permission": "allow",
+      "enabled": false
+    },
+    {
+      "id": "claude",
+      "label": "Claude Code",
+      "description": "Claude Code through its ACP adapter.",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@agentclientprotocol/claude-agent-acp@0.106.0"
+      ],
+      "cwd": ".",
+      "permission": "allow",
+      "enabled": false
+    }
+  ]
+}

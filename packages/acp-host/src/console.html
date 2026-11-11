@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Canvas — agent console</title>
+    <style>
+      :root {
+        --bg: #0d0f12;
+        --panel: #14171c;
+        --line: #232830;
+        --text: #e6e9ef;
+        --dim: #8b93a1;
+        --accent: #d9b26a;
+        --ok: #4fb477;
+        --bad: #d9645a;
+        font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: grid;
+        grid-template-columns: 240px 1fr;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 14px;
+      }
+      aside { border-right: 1px solid var(--line); padding: 14px; overflow: auto; }
+      h1 { font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); margin: 0 0 12px; }
+      .agent {
+        display: block; width: 100%; text-align: left; cursor: pointer;
+        background: transparent; color: var(--text); border: 1px solid transparent;
+        border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; font: inherit;
+      }
+      .agent:hover { border-color: var(--line); }
+      .agent[aria-pressed='true'] { border-color: var(--accent); background: #1b1f26; }
+      .agent small { display: block; color: var(--dim); font-size: 11px; margin-top: 2px; }
+      .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--line); margin-right: 6px; }
+      .dot.up { background: var(--ok); }
+      main { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+      #log { overflow: auto; padding: 18px 22px; display: flex; flex-direction: column; gap: 12px; }
+      .row { max-width: 900px; }
+      .who { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); margin-bottom: 4px; }
+      .bubble { white-space: pre-wrap; line-height: 1.55; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+      .me .bubble { border-color: #2f3946; background: #171b21; }
+      .tool { font-size: 12px; color: var(--dim); border-left: 2px solid var(--accent); padding-left: 8px; }
+      .err { color: var(--bad); white-space: pre-wrap; font-size: 12px; }
+      form { display: flex; gap: 8px; padding: 14px 18px; border-top: 1px solid var(--line); background: var(--panel); }
+      textarea {
+        flex: 1; resize: none; height: 54px; background: var(--bg); color: var(--text);
+        border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font: inherit;
+      }
+      textarea:focus { outline: none; border-color: var(--accent); }
+      button.send {
+        background: var(--accent); color: #17130a; border: 0; border-radius: 10px;
+        padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
+      }
+      button.send:disabled { opacity: 0.5; cursor: default; }
+      footer { grid-column: 1 / -1; border-top: 1px solid var(--line); padding: 6px 14px; font-size: 11px; color: var(--dim); display: flex; gap: 16px; }
+      code { color: var(--text); }
+    </style>
+  </head>
+  <body>
+    <aside>
+      <h1>Agents</h1>
+      <div id="agents"></div>
+    </aside>
+    <main>
+      <div id="log">
+        <div class="row">
+          <div class="bubble">Local console for the engine. Pick an agent, send a prompt, watch the stream. The same run is available to any workspace client on <code>/ag-ui/:agent</code>, and the board reads it on <code>/rpc</code> + <code>/events</code>.</div>
+        </div>
+      </div>
+      <form id="composer">
+        <textarea id="prompt" placeholder="Ask the selected agent something… (Enter to send, Shift+Enter for a newline)"></textarea>
+        <button class="send" id="send" type="submit">Send</button>
+      </form>
+    </main>
+    <footer>
+      <span id="state">connecting…</span>
+      <span>bridge <code id="href"></code></span>
+      <span id="count"></span>
+    </footer>
+    <script type="module">
+      const log = document.getElementById('log')
+      const agentsEl = document.getElementById('agents')
+      const stateEl = document.getElementById('state')
+      const countEl = document.getElementById('count')
+      const sendBtn = document.getElementById('send')
+      const promptEl = document.getElementById('prompt')
+      document.getElementById('href').textContent = location.origin
+
+      let agents = []
+      let current = null
+      let busy = false
+      const threads = new Map() // agentId -> threadId, so a session is reused
+
+      const add = (html, cls = '') => {
+        const row = document.createElement('div')
+        row.className = `row ${cls}`
+        row.innerHTML = html
+        log.append(row)
+        log.scrollTop = log.scrollHeight
+        return row
+      }
+
+      const renderAgents = () => {
+        agentsEl.innerHTML = ''
+        for (const agent of agents) {
+          const btn = document.createElement('button')
+          btn.className = 'agent'
+          btn.type = 'button'
+          btn.setAttribute('aria-pressed', String(agent.id === current))
+          btn.innerHTML = `<span class="dot ${agent.running ? 'up' : ''}"></span>${agent.label || agent.id}<small>${agent.command || agent.id}</small>`
+          btn.onclick = () => {
+            current = agent.id
+            renderAgents()
+          }
+          agentsEl.append(btn)
+        }
+      }
+
+      const load = async () => {
+        try {
+          const health = await fetch('/health').then((r) => r.json())
+          agents = health.agents.map((a) => ({ ...a }))
+          if (!current && agents.length) current = agents[0].id
+          renderAgents()
+          stateEl.textContent = `ready — ${agents.length} agent${agents.length === 1 ? '' : 's'}`
+          stateEl.style.color = 'var(--ok)'
+          countEl.textContent = agents.map((a) => `${a.id}: ${a.sessions} session(s)`).join(' · ')
+        } catch (error) {
+          stateEl.textContent = `bridge unreachable — ${error.message}`
+          stateEl.style.color = 'var(--bad)'
+        }
+      }
+
+      document.getElementById('composer').addEventListener('submit', async (event) => {
+        event.preventDefault()
+        const text = promptEl.value.trim()
+        if (!text || !current || busy) return
+        promptEl.value = ''
+        busy = true
+        sendBtn.disabled = true
+        add(`<div class="who">you</div><div class="bubble"></div>`, 'me').querySelector('.bubble').textContent = text
+
+        const reply = add(`<div class="who">${current}</div><div class="bubble"></div>`)
+        const bubble = reply.querySelector('.bubble')
+        const threadId = threads.get(current) || crypto.randomUUID()
+        threads.set(current, threadId)
+        let wrote = false
+
+        try {
+          const response = await fetch(`/ag-ui/${encodeURIComponent(current)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              threadId,
+              runId: crypto.randomUUID(),
+              messages: [{ id: crypto.randomUUID(), role: 'user', content: text }]
+            })
+          })
+          if (!response.ok || !response.body) throw new Error(`bridge answered ${response.status}`)
+
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
+
+          for (;;) {
+            const { value, done } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const frames = buffer.split('\n\n')
+            buffer = frames.pop() || ''
+            for (const frame of frames) {
+              const line = frame.split('\n').find((l) => l.startsWith('data: '))
+              if (!line) continue
+              const event = JSON.parse(line.slice(6))
+              if (event.type === 'TEXT_MESSAGE_CONTENT') {
+                wrote = true
+                bubble.textContent += event.delta
+                log.scrollTop = log.scrollHeight
+              } else if (event.type === 'TOOL_CALL_START') {
+                add(`<div class="tool">▸ ${event.toolCallName || 'tool'}</div>`)
+              } else if (event.type === 'TOOL_CALL_END') {
+                add(`<div class="tool">✓ tool finished</div>`)
+              } else if (event.type === 'RUN_ERROR') {
+                add(`<div class="err">${String(event.message).replace(/[<>&]/g, '')}</div>`)
+              }
+            }
+          }
+          if (!wrote && !bubble.textContent) bubble.textContent = '(no text returned)'
+        } catch (error) {
+          add(`<div class="err">${error.message}</div>`)
+        } finally {
+          busy = false
+          sendBtn.disabled = false
+          promptEl.focus()
+          load()
+        }
+      })
+
+      promptEl.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault()
+          document.getElementById('composer').requestSubmit()
+        }
+      })
+
+      setInterval(() => {
+        if (!busy) load()
+      }, 5000)
+      load()
+    </script>
+  </body>
+</html>

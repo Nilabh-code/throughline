@@ -1,0 +1,150 @@
+/* The shell around the board: chrome, theme tokens the page expects, toasts.
+   The board brings its own stylesheet (installStyles() in plugin.js). */
+
+:root {
+  color-scheme: dark;
+
+  /* Tokens the Hermes desktop app provides; the page reads these directly. */
+  --ui-text-primary: #e8ebf1;
+  --ui-text-secondary: #a8b0bd;
+  --ui-text-tertiary: #79818f;
+  --ui-text-quaternary: #5b6371;
+  --ui-surface-background: #14171c;
+  --ui-border: #262c36;
+  --ui-red: #d9645a;
+
+  --shell-bg: #0b0d10;
+  --shell-panel: #12151a;
+  --shell-line: #222831;
+  --shell-accent: #d9b26a;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background: var(--shell-bg);
+  color: var(--ui-text-primary);
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  height: 100%;
+  min-height: 0;
+}
+
+.rail {
+  border-right: 1px solid var(--shell-line);
+  background: var(--shell-panel);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 0;
+}
+
+.rail .brand {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: linear-gradient(140deg, #d9b26a, #b8863c);
+  color: #1a1409;
+  font-weight: 800;
+  font-size: 13px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 8px;
+}
+
+.rail button {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+  font-size: 15px;
+  display: grid;
+  place-items: center;
+}
+
+.rail button:hover { border-color: var(--shell-line); color: var(--ui-text-primary); }
+.rail button[aria-pressed='true'] { border-color: var(--shell-accent); color: var(--shell-accent); }
+
+.stage { min-width: 0; min-height: 0; overflow: hidden; position: relative; }
+
+.toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  max-width: 420px;
+  padding: 10px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--shell-line);
+  background: #171b21;
+  color: var(--ui-text-primary);
+  font-size: 13px;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 45%);
+  z-index: 9999;
+}
+
+.toast[data-kind='error'] { border-color: var(--ui-red); color: #f3c4c0; }
+
+/* Hermes' Tip: the title attribute does the work; keep the wrapper inline. */
+.wb-tip { display: inline-flex; }
+
+/* Streamdown output inside result cards. */
+.wb-streamdown { line-height: 1.5; }
+.wb-streamdown p { margin: 0 0 6px; }
+.wb-streamdown ul { margin: 0 0 6px; padding-left: 18px; }
+.wb-streamdown code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em;
+  background: rgb(255 255 255 / 8%);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.wb-streamdown pre {
+  background: rgb(255 255 255 / 6%);
+  border-radius: 8px;
+  padding: 8px 10px;
+  overflow: auto;
+}
+.wb-streamdown pre code { background: none; padding: 0; }
+.wb-streamdown blockquote {
+  margin: 0 0 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--shell-line);
+  color: var(--ui-text-secondary);
+}
+
+/* Which ACP agent the board's actions go to. */
+.coworker {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ui-text-tertiary);
+}
+
+.coworker select {
+  width: 44px;
+  font-size: 10px;
+  font-family: inherit;
+  background: var(--shell-panel);
+  color: var(--ui-text-primary);
+  border: 1px solid var(--shell-line);
+  border-radius: 7px;
+  padding: 2px 1px;
+  cursor: pointer;
+}
+
+.coworker select:focus { outline: none; border-color: var(--shell-accent); }

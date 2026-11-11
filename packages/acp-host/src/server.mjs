@@ -17,7 +17,7 @@
  *   node src/server.mjs [--port 8790] [--config agents.json]
  */
 import http from 'node:http'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { Readable, Writable } from 'node:stream'
 import { readFile, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
@@ -56,7 +56,25 @@ const resolveCommand = (command, args = []) => {
   const shellOnly = !!command.match(/\.(cmd|bat)$/i)
   const bare = !/^([a-z]:[\\/]|[\\/])/i.test(command)
   const exe = /\.exe$/i.test(command)
+  if (bare && !exe) {
+    // A bare name has to go through cmd.exe on Windows, which pollutes the
+    // JSON-RPC stream with the shell's own output. Prefer the real .exe that
+    // `where` finds; fall back to the shell only for .cmd shims.
+    const resolved = whichExecutable(command)
+    if (resolved) return { cmd: resolved, args, shell: false }
+  }
   return { cmd: command, args, shell: shellOnly || (bare && !exe) }
+}
+
+/** The first .exe on PATH for a bare command name, or null. */
+const whichExecutable = (command) => {
+  try {
+    const out = execFileSync('where', [command], { encoding: 'utf8', windowsHide: true })
+    const lines = out.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    return lines.find((line) => /\.exe$/i.test(line)) || null
+  } catch {
+    return null
+  }
 }
 
 const textOf = (content) => {
@@ -76,6 +94,8 @@ class AgentBridge {
   constructor(spec) {
     this.spec = spec
     this.id = spec.id
+    // ACP sessions take absolute paths; "." in a config is resolved once here.
+    this.cwd = path.resolve(spec.cwd || process.cwd())
     this.proc = null
     this.conn = null
     this.init = null
@@ -104,7 +124,7 @@ class AgentBridge {
     this.starting = (async () => {
       const { cmd, args, shell } = resolveCommand(this.spec.command, this.spec.args)
       const proc = spawn(cmd, args, {
-        cwd: this.spec.cwd || process.cwd(),
+        cwd: this.cwd,
         env: { ...process.env, ...(this.spec.env || {}) },
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
@@ -179,7 +199,7 @@ class AgentBridge {
     await this.start()
     let session = this.sessions.get(threadId)
     if (!session) {
-      session = await this.conn.agent.buildSession(this.spec.cwd || process.cwd()).start()
+      session = await this.conn.agent.buildSession(this.cwd).start()
       this.sessions.set(threadId, session)
     }
     return session

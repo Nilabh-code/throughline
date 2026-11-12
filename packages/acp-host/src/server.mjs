@@ -329,8 +329,7 @@ const sseHead = (res) => {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': '*'
+    'X-Accel-Buffering': 'no'
   })
 }
 
@@ -704,10 +703,43 @@ const json = (res, status, value) => {
   const body = JSON.stringify(value)
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-    'Access-Control-Allow-Origin': '*'
+    'Content-Length': Buffer.byteLength(body)
   })
   res.end(body)
+}
+
+/**
+ * Who may call us.
+ *
+ * The engine has no accounts, so the only identity a request carries is its
+ * Origin. A page on any site can POST to 127.0.0.1 without a preflight, and a
+ * cross-origin EventSource could read the whole event stream — so a request that
+ * names a foreign origin, or that the browser marks cross-site, is refused. CLI
+ * callers send no Origin at all and keep working. Set THROUGHLINE_TOKEN to also
+ * require a bearer token (worth doing the moment you bind 0.0.0.0).
+ */
+const EXTRA_ORIGINS = new Set(
+  (process.env.THROUGHLINE_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+)
+const AUTH_TOKEN = process.env.THROUGHLINE_TOKEN || ''
+
+const refusedBecause = (req) => {
+  const origin = req.headers.origin
+  if (origin) {
+    let host = null
+    try {
+      host = new URL(origin).host
+    } catch {
+      return 'malformed Origin'
+    }
+    if (host !== req.headers.host && !EXTRA_ORIGINS.has(origin)) return 'cross-origin request refused'
+  }
+  if (req.headers['sec-fetch-site'] === 'cross-site') return 'cross-site request refused'
+  if (AUTH_TOKEN && req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) return 'missing bearer token'
+  return null
 }
 
 const URL_BASE = `http://${HOST}:${PORT}`
@@ -860,6 +892,10 @@ async function serveBoard(req, res, url) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
 
+  // Origin is the only identity a request has; check it before doing any work.
+  const refusal = refusedBecause(req)
+  if (refusal) return json(res, 403, { error: refusal })
+
   if (req.method === 'GET' && url.pathname.startsWith('/board')) {
     return serveBoard(req, res, url)
   }
@@ -895,11 +931,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-    })
+    res.writeHead(204)
     return res.end()
   }
 

@@ -25,7 +25,9 @@ const proc = spawn(cmd, args, {
   cwd,
   env: process.env,
   stdio: ['pipe', 'pipe', 'pipe'],
-  windowsHide: true
+  windowsHide: true,
+  // Windows resolves only .exe through CreateProcess; npm CLIs are .cmd shims.
+  shell: process.platform === 'win32' && !/^([a-z]:[\\/]|[\\/])/i.test(cmd) && !/\.exe$/i.test(cmd)
 })
 proc.stderr.on('data', (d) => process.stderr.write(`[agent stderr] ${d}`))
 proc.on('error', (e) => console.error('[spawn error]', e.message))

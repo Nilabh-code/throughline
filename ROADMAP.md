@@ -5,6 +5,8 @@
 - Engine: ACP agents over stdio, one session per board, AG-UI + RPC lanes
 - Board host: the contract a module is written against (atoms, host verbs, icons, areas)
 - App: loads a module, renders it, gives it storage / rest / os, scroll-to-zoom, agent picker
+- **Bots dashboard**: create workers (ACP or CLI), fan one task out to several in parallel, stream each
+  result into its own column
 - Three headless suites that drive the real page
 
 ## Next

@@ -249,6 +249,72 @@ class AgentBridge {
   }
 }
 
+/**
+ * A bot backed by a plain CLI process: prompt in on argv/stdin, stdout out.
+ * For agents that do not speak ACP at all (pi, one-shot scripts), so they still
+ * behave like a bot in the dashboard instead of being excluded.
+ */
+class CliBridge {
+  constructor(spec) {
+    this.spec = spec
+    this.id = spec.id
+    this.cwd = path.resolve(spec.cwd || process.cwd())
+    this.proc = null
+  }
+
+  get running() {
+    return Boolean(this.proc)
+  }
+
+  /** One-shot: spawn, feed the task, stream stdout, resolve on exit. */
+  async *run(_threadId, task) {
+    const { cmd, args, shell } = resolveCommand(this.spec.command, this.spec.args || [])
+    const proc = spawn(cmd, [...args, task], {
+      cwd: this.cwd,
+      env: { ...process.env, ...(this.spec.env || {}) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      shell
+    })
+    this.proc = proc
+    let stderr = ''
+    proc.stderr.on('data', (chunk) => {
+      stderr = `${stderr}${chunk}`.slice(-2000)
+    })
+
+    const pending = []
+    let done = false
+    proc.stdout.on('data', (chunk) => pending.push(String(chunk)))
+    const exited = new Promise((resolveExit) => proc.on('exit', (code) => resolveExit(code ?? 0)))
+
+    for (;;) {
+      if (pending.length) {
+        yield { kind: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: pending.shift() } } }
+        continue
+      }
+      const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r(null), 120))])
+      if (code === null) continue
+      while (pending.length) {
+        yield { kind: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: pending.shift() } } }
+      }
+      this.proc = null
+      if (code !== 0 && !pending.length) {
+        throw new Error(stderr.trim().split('\n').slice(-3).join(' ') || `exited with code ${code}`)
+      }
+      yield { kind: 'stop', stopReason: 'end_turn', response: {} }
+      return
+    }
+  }
+
+  dispose() {
+    try {
+      this.proc?.kill()
+    } catch {}
+  }
+
+  reset() {}
+}
+
 const bridges = new Map()
 const bridgeFor = (id) => {
   const found = bridges.get(id)
@@ -351,6 +417,58 @@ let defaultAgent = 'hermes'
 const boardSessions = new Map()
 const sessionScope = new Map()
 
+// ---------------------------------------------------------------- bots ---
+
+/** Bots are user-created workers; each carries its own command, so no agent config is global. */
+const bots = new Map()
+const botBridges = new Map()
+const BOTS_FILE = () => path.join(DATA_DIR, 'bots.json')
+
+const botBridgeFor = (bot) => {
+  let bridge = botBridges.get(bot.id)
+  if (!bridge) {
+    bridge = bot.kind === 'cli' ? new CliBridge(bot) : new AgentBridge(bot)
+    botBridges.set(bot.id, bridge)
+  }
+  return bridge
+}
+
+const saveBots = async () => {
+  await writeJson(BOTS_FILE(), [...bots.values()])
+}
+
+const loadBots = async () => {
+  const saved = await readJson(BOTS_FILE(), [])
+  for (const bot of Array.isArray(saved) ? saved : []) {
+    if (bot?.id && bot?.command) bots.set(bot.id, bot)
+  }
+  return bots.size
+}
+
+/** Run one task on one bot, streaming its output as bot.* events. */
+async function runBotTask(bot, task) {
+  const bridge = botBridgeFor(bot)
+  const startedAt = Date.now()
+  let text = ''
+  broadcast({ type: 'bot.start', bot_id: bot.id, name: bot.name, kind: bot.kind })
+  try {
+    for await (const chunk of bridge.run(bot.id, task)) {
+      if (chunk.kind === 'stop') {
+        broadcast({ type: 'bot.complete', bot_id: bot.id, name: bot.name, text, ms: Date.now() - startedAt })
+        return { ok: true, bot: bot.id, text }
+      }
+      if (chunk.update?.sessionUpdate !== 'agent_message_chunk') continue
+      const piece = textOf(chunk.update.content)
+      if (!piece) continue
+      text += piece
+      broadcast({ type: 'bot.delta', bot_id: bot.id, name: bot.name, text: piece })
+    }
+  } catch (error) {
+    broadcast({ type: 'bot.error', bot_id: bot.id, name: bot.name, message: error?.message || String(error) })
+    return { ok: false, bot: bot.id, error: error?.message || String(error) }
+  }
+}
+
 /** The verbs a board module's agent loop speaks. */
 async function handleRpc(method, params, boardId = null) {
   const agentId = params?.agent || params?.agent_id || defaultAgent
@@ -369,6 +487,74 @@ async function handleRpc(method, params, boardId = null) {
       if (!bridges.has(wanted)) throw new Error(`unknown agent: ${wanted}`)
       defaultAgent = wanted
       return { selected: defaultAgent }
+    }
+
+    // ---- bots: user-created workers, fanned out in parallel ----------------
+
+    case 'bots.list':
+      return {
+        bots: [...bots.values()].map((bot) => ({
+          id: bot.id,
+          name: bot.name,
+          kind: bot.kind || 'acp',
+          command: bot.command,
+          args: bot.args || [],
+          cwd: bot.cwd || '.',
+          running: Boolean(botBridges.get(bot.id)?.proc)
+        }))
+      }
+
+    case 'bots.upsert': {
+      const input = params?.bot || params || {}
+      const id = String(input.id || input.name || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .slice(0, 48)
+      if (!id) throw new Error('bots.upsert needs a name')
+      const command = String(input.command || '').trim()
+      if (!command) throw new Error('bots.upsert needs a command')
+
+      const bot = {
+        id,
+        name: String(input.name || id).slice(0, 60),
+        kind: input.kind === 'cli' ? 'cli' : 'acp',
+        command,
+        args: Array.isArray(input.args) ? input.args.map(String) : String(input.args || '').split(/\s+/).filter(Boolean),
+        cwd: String(input.cwd || '.').trim() || '.',
+        env: input.env && typeof input.env === 'object' ? input.env : {},
+        permission: input.permission === 'deny' ? 'deny' : 'allow'
+      }
+
+      botBridges.get(id)?.dispose()
+      botBridges.delete(id)
+      bots.set(id, bot)
+      await saveBots()
+      return { bot }
+    }
+
+    case 'bots.remove': {
+      const id = String(params?.id || '')
+      botBridges.get(id)?.dispose()
+      botBridges.delete(id)
+      const existed = bots.delete(id)
+      await saveBots()
+      return { removed: existed ? id : null }
+    }
+
+    case 'bots.run': {
+      const ids = Array.isArray(params?.ids) ? params.ids.map(String) : []
+      const task = String(params?.task || '').trim()
+      if (!ids.length) throw new Error('bots.run needs ids')
+      if (!task) throw new Error('bots.run needs a task')
+
+      const chosen = ids.map((id) => bots.get(id)).filter(Boolean)
+      if (!chosen.length) throw new Error('bots.run: no known bots in ids')
+
+      // Fan out: every chosen bot gets the same task at once. Results arrive as
+      // bot.* events, so a slow bot never blocks a fast one.
+      void Promise.allSettled(chosen.map((bot) => runBotTask(bot, task)))
+      return { started: chosen.map((bot) => bot.id) }
     }
 
     case 'session.create': {
@@ -731,7 +917,8 @@ const server = http.createServer(async (req, res) => {
       })),
       agUiRoutes: [...bridges.keys()].map((id) => `/ag-ui/${id}`),
       boards: [...boardSessions.entries()].map(([key, session]) => ({ key, session })),
-      defaultAgent
+      defaultAgent,
+      bots: [...bots.values()].map((bot) => ({ id: bot.id, name: bot.name, kind: bot.kind || 'acp', running: Boolean(botBridges.get(bot.id)?.proc) }))
     })
   }
 
@@ -811,6 +998,7 @@ const server = http.createServer(async (req, res) => {
 // -------------------------------------------------------------------- boot ---
 
 const config = await loadConfig()
+const savedBots = await loadBots()
 for (const spec of config.agents) {
   if (!spec?.id || !spec?.command) {
     console.error(`[config] skipping an entry without id/command: ${JSON.stringify(spec)}`)

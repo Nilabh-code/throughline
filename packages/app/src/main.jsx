@@ -25,6 +25,7 @@ import {
 
 import './shell.css'
 import { installScrollZoom } from './scroll-zoom.js'
+import { Bots } from './bots.jsx'
 
 // --------------------------------------------------------------- storage ---
 
@@ -57,18 +58,8 @@ const storage = {
 
 // ------------------------------------------------------------------- rest ---
 
-/** ctx.rest — the bridge's boards/sharing/inbox lane, same paths the plugin uses. */
-async function rest(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method || 'GET',
-    headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
-    body: options.body ? JSON.stringify(options.body) : undefined
-  })
-  const text = await response.text()
-  const payload = text ? JSON.parse(text) : {}
-  if (!response.ok) throw new Error(payload.error || `${path} -> ${response.status}`)
-  return payload
-}
+// ctx.rest — the engine's boards/sharing/inbox lane, same paths a module uses.
+import { rest } from './rest.js'
 
 // --------------------------------------------------------------------- os ---
 
@@ -233,7 +224,15 @@ function App() {
   return (
     <div className="shell">
       <nav className="rail">
-        <div className="brand" title="Canvas">C</div>
+        <div className="brand" title="Throughline">T</div>
+        <button
+          type="button"
+          title="Bots"
+          aria-pressed={path === '/bots'}
+          onClick={() => go('/bots')}
+        >
+          🤖
+        </button>
         {navEntries.map((entry) => (
           <button
             key={entry.id || entry.data?.path}
@@ -248,7 +247,7 @@ function App() {
         <Coworker />
       </nav>
       <main className="stage" ref={stageRef}>
-        {route ? route.render() : <p style={{ padding: 20 }}>No page registered.</p>}
+        {path === '/bots' ? <Bots /> : route ? route.render() : <p style={{ padding: 20 }}>No page registered.</p>}
       </main>
       <Toasts />
     </div>

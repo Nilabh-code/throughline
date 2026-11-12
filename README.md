@@ -83,6 +83,43 @@ BOARD_MODULE=/path/to/board.js npm --prefix packages/app run build
 # or drop it at vendored/board/plugin.js
 ```
 
+## Bots
+
+The rail's 🤖 button opens the dashboard: create a worker per agent, tick several, hand them the same task,
+and each result streams into its own column. Two kinds:
+
+| Kind | For | How it runs |
+|---|---|---|
+| `acp` | agents that speak ACP (Hermes, Claude Code, Codex, OpenCode) | spawned once, sessions reused, streamed over ACP |
+| `cli` | agents that are just a command (pi, scripts) | one process per task, stdout streamed |
+
+![The bots dashboard: two bots, one task, results side by side](docs/bots.png)
+
+Bots are data — `bots.json` in the data dir, editable from the panel or the API:
+
+```json
+{ "id": "hermes-a", "name": "Hermes A", "kind": "acp", "command": "hermes", "args": ["acp"], "cwd": "." }
+```
+
+RPC: `bots.list`, `bots.upsert`, `bots.remove`, `bots.run` (`{ids, task}`). A run fans out with
+`Promise.allSettled`, so a slow bot never blocks a fast one, and results arrive as
+`bot.start` / `bot.delta` / `bot.complete` / `bot.error` on `/events` — each carrying `bot_id`.
+
+### What each agent actually does today
+
+Measured, not assumed — `node packages/acp-host/src/smoke.mjs <command>` per agent:
+
+| Agent | Kind | State |
+|---|---|---|
+| Hermes | acp | **works end to end** (`session/new` → prompt → `end_turn`) |
+| Claude Code | acp | attaches; run fails until a valid model/provider is configured for the account |
+| Codex | acp | adapter initialises; needs an API key (`authMethods: api-key`) |
+| OpenCode | acp | attaches; its own provider config rejects the model |
+| pi | cli | runs; needs `pi /login` (provider auth) before it can answer |
+
+Two bots of the same agent already run in parallel (verified: two `BOT OK` in ~26 s, not 53 s), and a `cli`
+bot that fails surfaces its stderr tail as `bot.error` instead of hanging.
+
 ## Sessions
 
 One conversation per board. The board's active id travels with every RPC, so commands on the same

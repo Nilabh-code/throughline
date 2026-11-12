@@ -51,6 +51,28 @@ const loadConfig = async () => {
  * (`opencode`, `claude`, `npx`) has to go through the shell to find its `.cmd` shim. Absolute
  * `.exe` paths — like hermes-acp — are spawned directly, which keeps their stdio clean.
  */
+/**
+ * The task is data. cmd.exe concatenates argv without escaping, so anything we
+ * hand to it unquoted can turn an '&' in a prompt into a second command.
+ */
+const quoteForShell = (value) => `"${String(value).replace(/"/g, '""')}"`
+
+/** Reject when a promise never settles, so a wedged agent cannot hang a run. */
+const withTimeout = (promise, ms, message) =>
+  new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+
 const resolveCommand = (command, args = []) => {
   if (process.platform !== 'win32') return { cmd: command, args, shell: false }
   const shellOnly = !!command.match(/\.(cmd|bat)$/i)
@@ -101,6 +123,7 @@ class AgentBridge {
     this.init = null
     this.starting = null
     this.sessions = new Map()
+    this.inflight = new Map()
     this.listeners = new Set()
   }
 
@@ -158,11 +181,15 @@ class AgentBridge {
 
       this.proc = proc
       this.conn = conn
-      this.init = await conn.agent.request('initialize', {
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
-        clientInfo: { name: 'throughline-host', version: '0.1.0' }
-      })
+      this.init = await withTimeout(
+        conn.agent.request('initialize', {
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+          clientInfo: { name: 'throughline-host', version: '0.1.0' }
+        }),
+        30_000,
+        'agent did not answer initialize within 30s'
+      )
       this.emit({ type: 'agent.ready', agent: this.id, protocolVersion: this.init?.protocolVersion })
       return this
     })()
@@ -170,6 +197,14 @@ class AgentBridge {
       return await this.starting
     } catch (error) {
       this.starting = null
+      try {
+        this.conn?.close()
+      } catch {}
+      try {
+        this.proc?.kill()
+      } catch {}
+      this.proc = null
+      this.conn = null
       throw error
     }
   }
@@ -197,11 +232,22 @@ class AgentBridge {
 
   async session(threadId) {
     await this.start()
-    let session = this.sessions.get(threadId)
-    if (!session) {
-      session = await this.conn.agent.buildSession(this.cwd).start()
-      this.sessions.set(threadId, session)
+    const existing = this.sessions.get(threadId)
+    if (existing) return existing
+
+    // Park the in-flight promise: two concurrent prompts on one thread would
+    // otherwise both call session/new and fork the conversation.
+    let pending = this.inflight.get(threadId)
+    if (!pending) {
+      pending = this.conn.agent.buildSession(this.cwd).start()
+      this.inflight.set(threadId, pending)
+      pending.then(
+        () => this.inflight.delete(threadId),
+        () => this.inflight.delete(threadId)
+      )
     }
+    const session = await pending
+    this.sessions.set(threadId, session)
     return session
   }
 
@@ -269,7 +315,8 @@ class CliBridge {
   /** One-shot: spawn, feed the task, stream stdout, resolve on exit. */
   async *run(_threadId, task) {
     const { cmd, args, shell } = resolveCommand(this.spec.command, this.spec.args || [])
-    const proc = spawn(cmd, [...args, task], {
+    const argv = [...args, task].map((value) => (shell ? quoteForShell(value) : value))
+    const proc = spawn(cmd, argv, {
       cwd: this.cwd,
       env: { ...process.env, ...(this.spec.env || {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -278,28 +325,41 @@ class CliBridge {
     })
     this.proc = proc
     let stderr = ''
+    let spawnError = null
     proc.stderr.on('data', (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-2000)
     })
 
     const pending = []
-    let done = false
     proc.stdout.on('data', (chunk) => pending.push(String(chunk)))
-    const exited = new Promise((resolveExit) => proc.on('exit', (code) => resolveExit(code ?? 0)))
+    // A missing binary emits 'error', never 'exit'. Without a listener that
+    // error is unhandled and takes the whole engine down with it.
+    const exited = new Promise((resolveExit) => {
+      proc.on('exit', (code, signal) => resolveExit(code ?? (signal ? -1 : 0)))
+      proc.on('error', (error) => {
+        spawnError = error
+        resolveExit(-1)
+      })
+    })
 
+    let produced = false
     for (;;) {
       if (pending.length) {
+        produced = true
         yield { kind: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: pending.shift() } } }
         continue
       }
       const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r(null), 120))])
       if (code === null) continue
       while (pending.length) {
+        produced = true
         yield { kind: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: pending.shift() } } }
       }
       this.proc = null
-      if (code !== 0 && !pending.length) {
-        throw new Error(stderr.trim().split('\n').slice(-3).join(' ') || `exited with code ${code}`)
+      if (spawnError) throw new Error(`could not start ${cmd}: ${spawnError.code || spawnError.message}`)
+      if (code !== 0) {
+        const tail = stderr.trim().split('\n').slice(-3).join(' ')
+        throw Object.assign(new Error(tail || `exited with code ${code}`), { exitCode: code, produced })
       }
       yield { kind: 'stop', stopReason: 'end_turn', response: {} }
       return
@@ -437,41 +497,86 @@ const saveBots = async () => {
 }
 
 const loadBots = async () => {
-  const saved = await readJson(BOTS_FILE(), [])
-  for (const bot of Array.isArray(saved) ? saved : []) {
+  let raw
+  try {
+    raw = await readFile(BOTS_FILE(), 'utf8')
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error(`[bots] cannot read ${BOTS_FILE()}: ${error.message}`)
+    return 0
+  }
+
+  let saved
+  try {
+    saved = JSON.parse(raw)
+  } catch (error) {
+    // Keep the broken file for a human and say so — booting empty means the next
+    // save silently overwrites whatever was recoverable.
+    console.error(`[bots] ${BOTS_FILE()} is not valid JSON (${error.message}); kept as bots.json.bad`)
+    try {
+      await rename(BOTS_FILE(), `${BOTS_FILE()}.bad`)
+    } catch {}
+    return 0
+  }
+
+  const list = Array.isArray(saved) ? saved : Array.isArray(saved?.bots) ? saved.bots : []
+  for (const bot of list) {
     if (bot?.id && bot?.command) bots.set(bot.id, bot)
+    else console.error(`[bots] skipping an entry without id/command: ${JSON.stringify(bot)}`)
   }
   return bots.size
 }
 
+const BOT_TIMEOUT = Number(process.env.THROUGHLINE_BOT_TIMEOUT || 5 * 60_000)
+/** botId -> run id. One run per bot: no silent duplicate work, and running is a count, not a guess. */
+const botRuns = new Map()
+
 /** Run one task on one bot, streaming its output as bot.* events. */
 async function runBotTask(bot, task) {
+  if (botRuns.has(bot.id)) {
+    broadcast({ type: 'bot.error', bot_id: bot.id, name: bot.name, message: 'already running' })
+    return { ok: false, bot: bot.id, error: 'already running' }
+  }
+  const runId = `${bot.id}-${Date.now().toString(36)}`
+  botRuns.set(bot.id, runId)
   const bridge = botBridgeFor(bot)
   const startedAt = Date.now()
   let text = ''
-  broadcast({ type: 'bot.start', bot_id: bot.id, name: bot.name, kind: bot.kind })
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    try {
+      bridge.dispose()
+    } catch {}
+  }, BOT_TIMEOUT)
+  broadcast({ type: 'bot.start', bot_id: bot.id, run_id: runId, name: bot.name, kind: bot.kind })
   try {
     for await (const chunk of bridge.run(bot.id, task)) {
       if (chunk.kind === 'stop') {
-        broadcast({ type: 'bot.complete', bot_id: bot.id, name: bot.name, text, ms: Date.now() - startedAt })
+        broadcast({ type: 'bot.complete', bot_id: bot.id, run_id: runId, name: bot.name, text, ms: Date.now() - startedAt })
         return { ok: true, bot: bot.id, text }
       }
       if (chunk.update?.sessionUpdate !== 'agent_message_chunk') continue
       const piece = textOf(chunk.update.content)
       if (!piece) continue
       text += piece
-      broadcast({ type: 'bot.delta', bot_id: bot.id, name: bot.name, text: piece })
+      broadcast({ type: 'bot.delta', bot_id: bot.id, run_id: runId, name: bot.name, text: piece })
     }
   } catch (error) {
-    broadcast({ type: 'bot.error', bot_id: bot.id, name: bot.name, message: error?.message || String(error) })
-    return { ok: false, bot: bot.id, error: error?.message || String(error) }
+    const message = timedOut ? `timed out after ${Math.round(BOT_TIMEOUT / 1000)}s` : error?.message || String(error)
+    broadcast({ type: 'bot.error', bot_id: bot.id, run_id: runId, name: bot.name, message, text })
+    return { ok: false, bot: bot.id, error: message, text }
+  } finally {
+    clearTimeout(timer)
+    botRuns.delete(bot.id)
   }
 }
 
 /** The verbs a board module's agent loop speaks. */
 async function handleRpc(method, params, boardId = null) {
   const agentId = params?.agent || params?.agent_id || defaultAgent
-  const bridge = bridgeFor(agentId)
+  // Resolved per case, not up front: an engine with no configured agents must
+  // still answer bots.* and agent.list instead of failing every verb.
+  const bridge = () => bridgeFor(agentId)
   const sessionId = params?.session_id || params?.sessionId
 
   switch (method) {
@@ -499,7 +604,8 @@ async function handleRpc(method, params, boardId = null) {
           command: bot.command,
           args: bot.args || [],
           cwd: bot.cwd || '.',
-          running: Boolean(botBridges.get(bot.id)?.proc)
+          running: botRuns.has(bot.id),
+          run_id: botRuns.get(bot.id) || null
         }))
       }
 
@@ -547,13 +653,20 @@ async function handleRpc(method, params, boardId = null) {
       if (!ids.length) throw new Error('bots.run needs ids')
       if (!task) throw new Error('bots.run needs a task')
 
-      const chosen = ids.map((id) => bots.get(id)).filter(Boolean)
+      const chosen = [...new Set(ids)].map((id) => bots.get(id)).filter(Boolean)
       if (!chosen.length) throw new Error('bots.run: no known bots in ids')
 
       // Fan out: every chosen bot gets the same task at once. Results arrive as
-      // bot.* events, so a slow bot never blocks a fast one.
-      void Promise.allSettled(chosen.map((bot) => runBotTask(bot, task)))
-      return { started: chosen.map((bot) => bot.id) }
+      // bot.* events, so a slow bot never blocks a fast one. A bot already busy is
+      // reported as skipped rather than silently run twice.
+      const runnable = chosen.filter((bot) => !botRuns.has(bot.id))
+      const skipped = chosen.filter((bot) => botRuns.has(bot.id)).map((bot) => bot.id)
+      for (const id of skipped) {
+        const bot = bots.get(id)
+        broadcast({ type: 'bot.error', bot_id: id, name: bot?.name, message: 'already running' })
+      }
+      void Promise.allSettled(runnable.map((bot) => runBotTask(bot, task)))
+      return { started: runnable.map((bot) => bot.id), skipped }
     }
 
     case 'session.create': {
@@ -575,7 +688,7 @@ async function handleRpc(method, params, boardId = null) {
       const scope = sessionScope.get(sessionId)
       if (scope?.board) boardSessions.delete(`${scope.board}:${scope.agent}`)
       sessionScope.delete(sessionId)
-      bridge.reset(sessionId)
+      bridge().reset(sessionId)
       return { reset: true }
     }
 
@@ -583,7 +696,7 @@ async function handleRpc(method, params, boardId = null) {
       return { session_id: sessionId, hidden: Boolean(params?.hidden) }
 
     case 'session.interrupt':
-      return await bridge.cancel(sessionId)
+      return await bridge().cancel(sessionId)
 
     case 'approval.pending':
       return { approvals: [] } // approvals are answered inside the run (see AgentBridge.permission)
@@ -594,7 +707,7 @@ async function handleRpc(method, params, boardId = null) {
     case 'prompt.submit': {
       const text = params?.text || ''
       if (!text) throw new Error('prompt.submit needs text')
-      void streamToEvents(bridge, sessionId, text)
+      void streamToEvents(bridge(), sessionId, text)
       return { accepted: true, session_id: sessionId }
     }
 
@@ -674,20 +787,26 @@ async function streamToEvents(bridge, sessionId, text) {
 
 // -------------------------------------------------------------------- http ---
 
+const MAX_BODY = 8 * 1024 * 1024
+
 const readBody = (req) =>
   new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
+    let tooBig = false
     req.on('data', (chunk) => {
       size += chunk.length
-      if (size > 8 * 1024 * 1024) {
-        reject(new Error('body too large'))
-        req.destroy()
+      if (size > MAX_BODY) {
+        // Keep draining instead of destroying the socket: a reset gives the
+        // caller no status at all, and a 413 is the answer they can act on.
+        tooBig = true
+        chunks.length = 0
         return
       }
       chunks.push(chunk)
     })
     req.on('end', () => {
+      if (tooBig) return reject(Object.assign(new Error('body too large'), { status: 413 }))
       const raw = Buffer.concat(chunks).toString('utf8')
       if (!raw) return resolve({})
       try {
@@ -726,7 +845,25 @@ const EXTRA_ORIGINS = new Set(
 )
 const AUTH_TOKEN = process.env.THROUGHLINE_TOKEN || ''
 
+/**
+ * DNS rebinding makes Origin and Host agree, so the origin comparison alone is
+ * not enough: a page at http://rebind.test:PORT can reach the engine on
+ * 127.0.0.1 and look same-origin. A browser always sends the name it resolved,
+ * and that name is never one of ours. Add names here (THROUGHLINE_HOSTS) before
+ * you serve the engine over a LAN address or a tunnel.
+ */
+const ALLOWED_HOSTS = new Set(
+  (process.env.THROUGHLINE_HOSTS || '127.0.0.1,localhost,::1,[::1]')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+)
+
 const refusedBecause = (req) => {
+  const hostHeader = String(req.headers.host || '')
+  const hostname = hostHeader.replace(/:\d+$/, '').toLowerCase() || 'localhost'
+  if (!ALLOWED_HOSTS.has(hostname)) return `unexpected Host: ${hostHeader}`
+
   const origin = req.headers.origin
   if (origin) {
     let host = null
@@ -746,7 +883,7 @@ const URL_BASE = `http://${HOST}:${PORT}`
 const CONSOLE_FILE = new URL('./console.html', import.meta.url)
 
 // ---- boards lane: what the board module persists through ctx.rest ----------
-import { mkdir, readdir, unlink } from 'node:fs/promises'
+import { mkdir, readdir, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -767,9 +904,12 @@ const readJson = async (file, fallback = null) => {
     return fallback
   }
 }
+/** Write via rename: a crash mid-write must never leave a board reading as "gone". */
 const writeJson = async (file, value) => {
   await mkdir(path.dirname(file), { recursive: true })
-  await writeFile(file, JSON.stringify(value), 'utf8')
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+  await writeFile(tmp, JSON.stringify(value), 'utf8')
+  await rename(tmp, file)
 }
 
 /** Dev aid: the last board run, prompt and reply, on disk to inspect. */
@@ -896,7 +1036,9 @@ const server = http.createServer(async (req, res) => {
   const refusal = refusedBecause(req)
   if (refusal) return json(res, 403, { error: refusal })
 
-  if (req.method === 'GET' && url.pathname.startsWith('/board')) {
+  // Exact match on /board plus its subtree: startsWith('/board') also swallowed
+  // /boards and /boards/:id, so the whole read lane answered with the app shell.
+  if (req.method === 'GET' && (url.pathname === '/board' || url.pathname.startsWith('/board/'))) {
     return serveBoard(req, res, url)
   }
 
@@ -948,7 +1090,8 @@ const server = http.createServer(async (req, res) => {
         protocolVersion: b.init?.protocolVersion ?? null
       })),
       agUiRoutes: [...bridges.keys()].map((id) => `/ag-ui/${id}`),
-      boards: [...boardSessions.entries()].map(([key, session]) => ({ key, session })),
+      boardCount: boardSessions.size,
+      boards: [...boardSessions.entries()].slice(0, 50).map(([key, session]) => ({ key, session })),
       defaultAgent,
       bots: [...bots.values()].map((bot) => ({ id: bot.id, name: bot.name, kind: bot.kind || 'acp', running: Boolean(botBridges.get(bot.id)?.proc) }))
     })
@@ -1002,7 +1145,17 @@ const server = http.createServer(async (req, res) => {
     try {
       payload = await readBody(req)
     } catch (error) {
-      return json(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: error.message } })
+      // Honour the status the reader attached (413 for an oversized body), so the
+      // caller gets something it can act on instead of a bare parse error.
+      const status = error.status || 400
+      return json(res, status, {
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: status === 413 ? -32600 : -32700, message: error.message }
+      })
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return json(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'invalid request' } })
     }
     const { id = null, method, params = {} } = payload
     const boardId = req.headers['x-throughline-board'] || payload.board || null
@@ -1039,6 +1192,11 @@ for (const spec of config.agents) {
   bridges.set(spec.id, new AgentBridge(spec))
 }
 
+server.on('error', (error) => {
+  console.error(error.code === 'EADDRINUSE' ? `port ${PORT} is already in use` : error.message)
+  process.exit(1)
+})
+
 server.listen(PORT, HOST, () => {
   console.log(`throughline engine  http://${HOST}:${PORT}`)
   for (const bridge of bridges.values()) {
@@ -1046,10 +1204,16 @@ server.listen(PORT, HOST, () => {
     console.log(`    AG-UI  POST http://${HOST}:${PORT}/ag-ui/${bridge.id}`)
   }
   console.log(`  board  POST /rpc   GET /events`)
+  if (HOST !== '127.0.0.1' && HOST !== 'localhost') {
+    console.log(`  ! bound to ${HOST}: add every name/IP you browse to THROUGHLINE_HOSTS=${HOST} (Host is checked)`)
+    console.log('  ! and set THROUGHLINE_TOKEN: anyone who reaches this port can run commands as you')
+  }
+  if (savedBots) console.log(`  bots   ${savedBots} restored from data dir`)
 })
 
 const shutdown = () => {
   for (const bridge of bridges.values()) bridge.dispose()
+  for (const bridge of botBridges.values()) bridge.dispose()
   server.close(() => process.exit(0))
   setTimeout(() => process.exit(0), 1500)
 }

@@ -83,6 +83,30 @@ BOARD_MODULE=/path/to/board.js npm --prefix packages/app run build
 # or drop it at vendored/board/plugin.js
 ```
 
+## Security posture
+
+The engine has no accounts. It binds `127.0.0.1` and treats the browser's `Origin` and `Host` as the only
+identity a request carries:
+
+- a foreign `Origin`, or `Sec-Fetch-Site: cross-site`, is a `403` — so a page you visit cannot POST `/rpc`
+  and spawn an agent, and a cross-origin `EventSource` cannot read your boards;
+- `Host` must be loopback. That is what stops DNS rebinding, where an attacker's page makes Origin and Host
+  agree (`http://rebind.test:PORT` → your `127.0.0.1`);
+- everything else is treated as data: board ids are validated against `^[A-Za-z0-9_-]{1,64}$`, files are
+  written through a temp file plus rename, and a bot's task is quoted before it ever meets a shell.
+
+Going beyond loopback needs two env vars, because anyone who reaches the port can run commands as you:
+
+```bash
+THROUGHLINE_HOSTS=192.168.1.50,my-box.tailnet.ts.net   # every name you will browse
+THROUGHLINE_TOKEN=$(openssl rand -hex 24)              # then send Authorization: Bearer <token>
+THROUGHLINE_BOT_TIMEOUT=300000                         # ms before a bot run is killed
+```
+
+`cd packages/acp-host && npm run security-check` replays the audit's break-in attempts — null bodies,
+rebinding, cross-origin POST and SSE, oversize bodies, the dead read lane, a missing bot binary, duplicate
+fan-out — as assertions.
+
 ## Bots
 
 The rail's 🤖 button opens the dashboard: create a worker per agent, tick several, hand them the same task,

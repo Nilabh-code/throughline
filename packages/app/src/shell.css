@@ -251,3 +251,43 @@ html, body, #root {
 .bot-column .wb-streamdown p { margin: 0 0 6px; }
 .bot-column .wb-streamdown ul { margin: 0 0 6px; }
 .bot-wait { color: var(--ui-text-tertiary); }
+
+/* ---- audit fixes ------------------------------------------------------- */
+
+/* F4: one column at phone widths instead of a panel scrolled off-screen. */
+@media (max-width: 760px) {
+  .bots { padding: 16px; }
+  .bots-grid { grid-template-columns: 1fr; }
+  .bot-columns { grid-template-columns: 1fr; }
+}
+
+/* F5: agent output wraps instead of being clipped mid-word. */
+.bot-column { min-width: 0; }
+.bot-column .wb-streamdown,
+.bot-column pre { overflow-wrap: anywhere; word-break: break-word; }
+
+/* F8: a long bot name must not squeeze the command into "cli...". */
+.bot-list label { min-width: 0; }
+.bot-name { flex: 0 1 auto; max-width: 58%; }
+.bot-meta { flex: 1 1 auto; margin-left: 8px; max-width: none; }
+
+/* F10: a disabled control should not still look like the primary action. */
+.bots button[type='submit']:disabled {
+  background: transparent;
+  color: var(--ui-text-tertiary);
+  border: 1px solid var(--shell-line);
+}
+
+/* F1: the onboarding copy sits on the paper canvas but inherits the shell's
+   light-on-dark ink — measured 1.10:1 for the headline, 2.01:1 for the body.
+   `.wb-empty` is the module's own container, so only its copy is re-inked. */
+.wb-page .wb-empty h1,
+.wb-page .wb-empty h2 {
+  color: #23262b;
+}
+.wb-page .wb-empty p {
+  color: #4a5058;
+}
+.wb-page .wb-empty .wb-empty-tip {
+  color: #4a5058;
+}

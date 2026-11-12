@@ -20,6 +20,7 @@ export function Bots() {
   const [running, setRunning] = useState({}) // botId -> {text, state, ms, error}
   const [notice, setNotice] = useState('')
   const sourceRef = useRef(null)
+  const [, setTick] = useState(0)
 
   const refresh = useCallback(async () => {
     try {
@@ -55,7 +56,7 @@ export function Bots() {
       const id = event.bot_id
       setRunning((current) => {
         const previous = current[id] || { text: '', state: 'idle' }
-        if (event.type === 'bot.start') return { ...current, [id]: { text: '', state: 'running' } }
+        if (event.type === 'bot.start') return { ...current, [id]: { text: '', state: 'running', at: Date.now() } }
         if (event.type === 'bot.delta') return { ...current, [id]: { ...previous, text: previous.text + event.text } }
         if (event.type === 'bot.complete')
           return { ...current, [id]: { ...previous, state: 'done', ms: event.ms, text: event.text || previous.text } }
@@ -65,6 +66,14 @@ export function Bots() {
     }
     return () => source.close()
   }, [])
+
+  // Tick only while something is in flight, so a finished dashboard is static.
+  const live = Object.values(running).some((run) => run.state === 'running' || run.state === 'queued')
+  useEffect(() => {
+    if (!live) return
+    const handle = setInterval(() => setTick((n) => n + 1), 1000)
+    return () => clearInterval(handle)
+  }, [live])
 
   const create = async (event) => {
     event.preventDefault()
@@ -198,7 +207,9 @@ export function Bots() {
           </form>
 
           <div className="bot-columns">
-            {columns.length === 0 ? <p className="bots-empty">Tick one or more bots to fan a task out.</p> : null}
+            {columns.length === 0 ? (
+              <p className="bots-empty">Tick one or more bots above, then give them a task — each result lands here as its own column.</p>
+            ) : null}
             {columns.map((id) => {
               const bot = bots.find((b) => b.id === id)
               const state = running[id] || { text: '', state: 'idle' }
@@ -206,14 +217,25 @@ export function Bots() {
                 <article key={id} className={`bot-column state-${state.state}`}>
                   <header>
                     <strong>{bot?.name || id}</strong>
-                    <span>{state.state === 'done' ? `${(state.ms / 1000).toFixed(1)}s` : state.state}</span>
+                    <span>
+                      {state.state === 'done'
+                        ? `${(state.ms / 1000).toFixed(1)}s`
+                        : state.state === 'running' && state.at
+                          ? `running ${Math.round((Date.now() - state.at) / 1000)}s`
+                          : state.state}
+                    </span>
                   </header>
                   {state.text ? (
                     <Streamdown>{state.text}</Streamdown>
                   ) : (
                     <pre className="bot-wait">{state.state === 'running' ? '…' : ''}</pre>
                   )}
-                  {state.error ? <p className="bot-error">{state.error}</p> : null}
+                  {state.error ? (
+                    <p className="bot-error">
+                      {state.error}
+                      {state.text ? ' — partial output above' : ''}
+                    </p>
+                  ) : null}
                 </article>
               )
             })}

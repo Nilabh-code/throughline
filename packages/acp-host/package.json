@@ -6,7 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node src/server.mjs --port 8790 --config agents.json",
-    "probe": "node src/smoke.mjs"
+    "probe": "node src/smoke.mjs",
+    "security-check": "node scripts/security-check.mjs"
   },
   "keywords": [],
   "author": "",

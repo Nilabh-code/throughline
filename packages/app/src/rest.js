@@ -8,5 +8,8 @@ export async function rest(path, options = {}) {
   const text = await response.text()
   const payload = text ? JSON.parse(text) : {}
   if (!response.ok) throw new Error(payload.error || `${path} -> ${response.status}`)
+  // JSON-RPC reports failure inside a 200 body. Without this, "Add bot" with a
+  // missing command looked like it worked: no bot, no message.
+  if (payload?.error) throw new Error(payload.error.message || payload.error)
   return payload
 }
